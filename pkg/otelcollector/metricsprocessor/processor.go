@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -21,51 +20,15 @@ import (
 )
 
 type metricsProcessor struct {
-	cfg                      *Config
-	workloadLatencyHistogram *prometheus.HistogramVec
+	cfg *Config
 }
 
 func newProcessor(cfg *Config) (*metricsProcessor, error) {
 	p := &metricsProcessor{
 		cfg: cfg,
 	}
-	err := p.registerRequestLatencyHistogram()
-	if err != nil {
-		return nil, err
-	}
 
 	return p, nil
-}
-
-func (p *metricsProcessor) registerRequestLatencyHistogram() error {
-	p.workloadLatencyHistogram = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name: metrics.WorkloadLatencyMetricName,
-		Help: "Latency histogram of workload",
-		Buckets: prometheus.LinearBuckets(
-			p.cfg.LatencyBucketStartMS,
-			p.cfg.LatencyBucketWidthMS,
-			p.cfg.LatencyBucketCount,
-		),
-	}, []string{
-		metrics.PolicyNameLabel,
-		metrics.PolicyHashLabel,
-		metrics.ComponentIndexLabel,
-		metrics.DecisionTypeLabel,
-		metrics.WorkloadIndexLabel,
-	})
-	err := p.cfg.promRegistry.Register(p.workloadLatencyHistogram)
-	if err != nil {
-		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
-			// We're registering this histogram vec from multiple processors
-			// (logs processor and traces processor), so if both processors are
-			// enabled, it's expected that whichever processor is created
-			// second, it will see that the histogram vec was already
-			// registered. Use the existing histogram vec from now on.
-			p.workloadLatencyHistogram = are.ExistingCollector.(*prometheus.HistogramVec)
-			return nil
-		}
-	}
-	return err
 }
 
 // Start indicates and logs the start of the metrics processor.
@@ -244,7 +207,10 @@ func (p *metricsProcessor) updateMetrics(
 	}
 
 	for _, fluxMeter := range checkResponse.FluxMeters {
-		p.updateMetricsForFluxMeters(fluxMeter, checkResponse.DecisionType, statusCodeStr, latency)
+		err = p.updateMetricsForFluxMeters(fluxMeter, checkResponse.DecisionType, statusCodeStr, latency)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -252,7 +218,7 @@ func (p *metricsProcessor) updateMetrics(
 
 func (p *metricsProcessor) updateMetricsForWorkload(labels map[string]string, latency float64, workload string) error {
 	labels[metrics.WorkloadIndexLabel] = workload
-	latencyHistogram, err := p.workloadLatencyHistogram.GetMetricWith(labels)
+	latencyHistogram, err := p.cfg.metricsAPI.GetTokenLatencyHistogram(labels)
 	if err != nil {
 		log.Warn().Err(err).Msg("Getting latency histogram")
 		return err
@@ -267,20 +233,19 @@ func (p *metricsProcessor) updateMetricsForFluxMeters(
 	decisionType flowcontrolv1.DecisionType,
 	statusCode string,
 	latency float64,
-) {
-	fluxmeterHistogram := p.cfg.engine.GetFluxMeterHist(
+) error {
+	fluxmeterHistogram, err := p.cfg.metricsAPI.GetFluxMeterHistogram(
 		fluxMeter.GetFluxMeterName(),
 		statusCode,
 		decisionType,
 	)
-	if fluxmeterHistogram == nil {
-		log.Debug().Str(metrics.FluxMeterNameLabel, fluxMeter.GetFluxMeterName()).
-			Str(metrics.DecisionTypeLabel, decisionType.String()).
-			Str(metrics.StatusCodeLabel, statusCode).
-			Msg("Fluxmeter not found")
-		return
+	if err != nil {
+		log.Warn().Err(err).Msg("Getting fluxmeter histogram")
+		return err
 	}
 	fluxmeterHistogram.Observe(latency)
+
+	return nil
 }
 
 func getLatencyLabel(attributes pcommon.Map) string {
